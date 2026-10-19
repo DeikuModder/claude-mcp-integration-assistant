@@ -15,9 +15,12 @@ import sys
 import json
 import shutil
 import subprocess
+import tempfile
 import threading
 import logging
 import platform
+import hashlib
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
@@ -65,6 +68,18 @@ def _read_bundled_version() -> str:
 
 APP_VERSION = _read_bundled_version()
 
+# ----------------------- automatic updater configuration --------------------
+# Releases are published by .github/workflows/release.yml when a v* tag is
+# pushed; the app polls that public repo's latest release for newer versions.
+UPDATER_REPO = "DeikuModder/claude-mcp-integration-assistant"
+
+
+def _update_asset_name(version: str) -> str:
+    """Asset filename produced by CI for the OS this app is running on."""
+    if platform.system() == "Windows":
+        return f"ClaudeMCPIntegrationAssistant-{version}-windows.exe"
+    return f"ClaudeMCPIntegrationAssistant-{version}-macos"
+
 # Status indicator glyphs expressed as escapes to keep this source ASCII-only.
 DOT_RED = "\u25cf"     # filled circle
 DOT_GREEN = "\u2713"   # check mark
@@ -98,6 +113,8 @@ class MCPIntegrationApp(ctk.CTk):
         # Run the first environment/status scan in the background so the
         # window appears instantly even on slow filesystems.
         self.after(100, self._initial_scan)
+        if APP_VERSION != "dev":
+            self.after(1500, lambda: self._check_for_updates(manual=False))
 
     # ------------------------------------------------------------------ UI ---
     def create_widgets(self):
@@ -126,6 +143,12 @@ class MCPIntegrationApp(ctk.CTk):
         self.status_package = self._create_status_indicator(status_frame, "Package", 0, 2)
         self.status_auth = self._create_status_indicator(status_frame, "Auth Token", 0, 3)
         self.status_claude = self._create_status_indicator(status_frame, "Claude JSON", 0, 4)
+        self.btn_updates = ctk.CTkButton(
+            status_frame, text="Check for updates", height=24, width=140,
+            command=lambda: self._check_for_updates(manual=True),
+            font=ctk.CTkFont(size=10),
+        )
+        self.btn_updates.grid(row=1, column=0, columnspan=4, padx=10, sticky="e")
 
     def _create_status_indicator(self, parent, label_text, row, col):
         indicator_frame = ctk.CTkFrame(parent)
@@ -860,6 +883,229 @@ class MCPIntegrationApp(ctk.CTk):
             except Exception:
                 pass
         self.destroy()
+
+    # ------------------------------------------------------------ auto-updater ---
+    def _update_settings_path(self) -> Path:
+        """Per-user settings file used to persist intentionally skipped updates."""
+        home = Path.home()
+        if platform.system() == "Windows":
+            base = Path(os.environ.get("APPDATA", str(home / "AppData" / "Roaming"))) / "ClaudeMCPAssistant"
+        elif platform.system() == "Darwin":
+            base = home / "Library" / "Application Support" / "ClaudeMCPAssistant"
+        else:
+            base = home / ".config" / "ClaudeMCPAssistant"
+        return base / "settings.json"
+
+    def _load_skip_set(self) -> set:
+        try:
+            with open(self._update_settings_path(), "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return set(data.get("skipped_versions", []))
+        except (OSError, json.JSONDecodeError, ValueError):
+            return set()
+
+    def _remember_skipped_version(self, version: str):
+        try:
+            path = self._update_settings_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            skipped = sorted(self._load_skip_set() | {version})
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"skipped_versions": skipped}, fh, indent=2)
+        except OSError as exc:
+            self.log_message(f"Could not persist skipped update: {exc}", level="WARNING")
+
+    @staticmethod
+    def _version_tuple(value: str) -> Optional[Tuple[int, ...]]:
+        value = value.strip().lstrip("vV")
+        if not value:
+            return None
+        try:
+            return tuple(int(part) for part in value.split("."))
+        except ValueError:
+            return None
+
+    @classmethod
+    def _is_newer(cls, candidate: str, current: str) -> bool:
+        c = cls._version_tuple(candidate)
+        cur = cls._version_tuple(current)
+        if not c or not cur:
+            return False  # never prompt against unparsable versions
+        return c > cur
+
+    def _fetch_latest_release(self) -> Dict[str, Any]:
+        """Query the repo's latest (stable, non-prerelease) release."""
+        url = f"https://api.github.com/repos/{UPDATER_REPO}/releases/latest"
+        request = urllib.request.Request(
+            url, headers={"Accept": "application/vnd.github+json", "User-Agent": "claude-mcp-assistant"},
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        asset_want = _update_asset_name(str(data.get("tag_name", "")).lstrip("vV"))
+        checksum_want = asset_want + ".sha256"
+        asset_url = checksum_url = None
+        for asset in data.get("assets", []):
+            if asset.get("name") == asset_want:
+                asset_url = asset.get("browser_download_url")
+            elif asset.get("name") == checksum_want:
+                checksum_url = asset.get("browser_download_url")
+        if not asset_url:
+            raise RuntimeError(f"No release asset for this platform ({asset_want})")
+        return {
+            "version": str(data.get("tag_name", "")).lstrip("vV"),
+            "notes": data.get("body", "") or "",
+            "asset_url": asset_url,
+            "checksum_url": checksum_url,
+        }
+
+    def _check_for_updates(self, manual: bool = False):
+        if APP_VERSION == "dev" and not manual:
+            return
+        if getattr(self, "_update_state", None) == "running":
+            self.log_message("An update check is already running.")
+            return
+        self._update_state = "running"
+        if manual:
+            self.btn_updates.configure(state="disabled")
+            self.log_message("Checking for updates...")
+        threading.Thread(target=self._update_check_worker, args=(manual,), daemon=True).start()
+
+    def _update_check_worker(self, manual: bool):
+        def done(status_text: Optional[str], info: Optional[Dict[str, Any]] = None):
+            self._update_state = "idle"
+
+            def apply():
+                self.btn_updates.configure(state="normal")
+                if status_text:
+                    self.log_message(status_text)
+                if info:
+                    self._prompt_update(info)
+            self.after(0, apply)
+
+        try:
+            release = self._fetch_latest_release()
+        except Exception as exc:
+            text = f"Update check failed: {exc}" if manual else f"Update check failed (offline or repo unavailable): {exc}"
+            done(text, None)
+            return
+
+        version = release["version"]
+        if self._is_newer(version, APP_VERSION):
+            if not manual and version in self._load_skip_set():
+                done(f"Update {version} available (previously skipped by you).", None)
+                return
+            done(f"Update available: v{version} (you are running v{APP_VERSION}).", release)
+            return
+        if version == APP_VERSION:
+            done("You are running the latest version.", None)
+        else:  # running a newer build than the latest release (pre-release/source)
+            done(f"No update needed (latest released: v{version}; you run v{APP_VERSION}).", None)
+
+    def _prompt_update(self, info: Dict[str, Any]):
+        version = info["version"]
+        notes = (info["notes"] or "").strip()
+        if len(notes) > 600:
+            notes = notes[:600].rstrip() + "\n..."
+        shown = notes or "This release contains improvements to the assistant."
+        proceed = messagebox.askyesno(
+            f"Update available: v{version}",
+            f"Version v{version} is available (you are running v{APP_VERSION}).\n\n"
+            f"{shown}\n\nUpdate now? The assistant will restart by itself.",
+        )
+        if not proceed:
+            remember = messagebox.askyesno(
+                "Skip this version",
+                f"Remind you about v{version} again next time?",
+            )
+            if not remember:
+                self._remember_skipped_version(version)
+                self.log_message(f"Update v{version} skipped (won't be suggested again).")
+            else:
+                self.log_message(f"Update v{version} skipped.")
+            return
+        self.log_message(f"Downloading update v{version}...")
+        self.btn_updates.configure(state="disabled")
+        threading.Thread(target=self._update_download_worker, args=(info,), daemon=True).start()
+
+    def _update_download_worker(self, info: Dict[str, Any]):
+        version = info["version"]
+        try:
+            temp_dir = Path(tempfile.gettempdir()) / "ClaudeMCPAssistantUpdate"
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            asset_name = _update_asset_name(version)
+            target = temp_dir / asset_name
+            urllib.request.urlretrieve(info["asset_url"], target)
+
+            if info.get("checksum_url"):
+                with urllib.request.urlopen(urllib.request.Request(
+                        info["checksum_url"], headers={"User-Agent": "claude-mcp-assistant"}), timeout=30) as resp:
+                    expected = resp.read().decode("utf-8").split()[0].strip().lower()
+                digest = hashlib.sha256(target.read_bytes()).hexdigest()
+                if digest != expected:
+                    raise RuntimeError(f"checksum mismatch (expected {expected[:12]}..., got {digest[:12]}...)")
+            else:
+                self.log_message("Release has no checksum file; skipping verification (not recommended).", level="WARNING")
+
+            self.log_message(f"Update v{version} downloaded and verified.")
+            self.after(0, lambda: self._apply_update(target, asset_name))
+        except Exception as exc:
+            message = str(exc)
+            self.log_message(f"Update download failed: {message}", level="ERROR")
+            self.after(0, lambda: (self.btn_updates.configure(state="normal"),
+                                   messagebox.showerror("Update failed", f"Could not download or verify the update.\n\n{message[:400]}")))
+
+    def _apply_update(self, new_binary: Path, asset_name: str):
+        """Swap the running executable for the freshly downloaded one."""
+        try:
+            current = Path(sys.executable)
+            if not current.is_file():
+                raise RuntimeError("Could not resolve the location of this app.")
+
+            if platform.system() == "Windows":
+                self._apply_update_windows(new_binary, current)
+            else:
+                self._apply_update_posix(new_binary, current)
+        except Exception as exc:
+            self.log_message(f"Applying update failed: {exc}", level="ERROR")
+            messagebox.showerror("Update failed", str(exc))
+            self.btn_updates.configure(state="normal")
+
+    def _apply_update_windows(self, new_binary: Path, current: Path):
+        """Windows can't overwrite a running .exe, so a detached PowerShell
+        helper waits for this process to exit, swaps the files, restarts us."""
+        backup = current.with_name(current.name + ".old.bak")
+        helper_script = Path(tempfile.gettempdir()) / "claude_mcp_update.ps1"
+        helper_script.write_text(
+            f"$current = '{current}'\n"
+            f"$new = '{new_binary}'\n"
+            f"$backup = '{backup}'\n"
+            f"$targetPid = {os.getpid()}\n"
+            "while (Get-Process -Id $targetPid -ErrorAction SilentlyContinue) { Start-Sleep -Milliseconds 300 }\n"
+            "if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Force }\n"
+            "Move-Item -LiteralPath $current -Destination $backup -Force\n"
+            "Move-Item -LiteralPath $new -Destination $current -Force\n"
+            "Start-Sleep -Seconds 1\n"
+            "Start-Process -FilePath $current\n",
+            encoding="utf-8",
+        )
+        env_copy = os.environ.copy()
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", str(helper_script)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW
+            env=env_copy,
+        )
+        self.log_message("Update staged; closing app so the new version can take its place...")
+        self.after(600, self.on_closing)
+
+    def _apply_update_posix(self, new_binary: Path, current: Path):
+        """On macOS the running binary can be replaced via atomic rename."""
+        staged = current.with_name(current.name + ".new")
+        shutil.copyfile(new_binary, staged)
+        os.chmod(staged, 0o755)
+        os.replace(staged, current)
+        self.log_message("Update installed; restarting...")
+        subprocess.Popen([str(current)], start_new_session=True)
+        self.after(600, self.on_closing)
 
 
 def main():
