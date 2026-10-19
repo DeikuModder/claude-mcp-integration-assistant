@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      test_tag:
+        description: "Version to write into version.txt for a non-publishing test build"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset_suffix: windows
+            path_sep: ";"
+          - os: macos-latest # Apple Silicon (arm64), per project decision
+            asset_suffix: macos-arm64
+            path_sep: ":"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Compute version from tag
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.test_tag }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          VERSION="${VERSION#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building version: $VERSION"
+
+      - name: Write version.txt
+        shell: bash
+        run: |
+          echo "${{ steps.version.outputs.version }}" > version.txt
+          cat version.txt
+
+      - name: Build Windows executable
+        if: matrix.os == 'windows-latest'
+        run: >
+          pyinstaller --name "ClaudeMCPIntegrationAssistant"
+          --windowed --onefile --noconfirm
+          --add-data "version.txt${{ matrix.path_sep }}."
+          main.py
+
+      - name: Build macOS executable
+        if: matrix.os == 'macos-latest'
+        run: >
+          pyinstaller --name "ClaudeMCPIntegrationAssistant"
+          --windowed --onefile --noconfirm
+          --add-data "version.txt${{ matrix.path_sep }}."
+          main.py
+
+      - name: Stage Windows asset
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          mkdir -p assets
+          cp dist/ClaudeMCPIntegrationAssistant.exe \
+             "assets/ClaudeMCPIntegrationAssistant-${{ steps.version.outputs.version }}-windows.exe"
+          cd assets
+          sha256sum "ClaudeMCPIntegrationAssistant-${{ steps.version.outputs.version }}-windows.exe" \
+            > "ClaudeMCPIntegrationAssistant-${{ steps.version.outputs.version }}-windows.exe.sha256"
+          ls -la
+
+      - name: Stage macOS asset
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          mkdir -p assets
+          cp dist/ClaudeMCPIntegrationAssistant \
+             "assets/ClaudeMCPIntegrationAssistant-${{ steps.version.outputs.version }}-macos"
+          chmod +x "assets/ClaudeMCPIntegrationAssistant-${{ steps.version.outputs.version }}-macos"
+          cd assets
+          shasum -a 256 "ClaudeMCPIntegrationAssistant-${{ steps.version.outputs.version }}-macos" \
+            > "ClaudeMCPIntegrationAssistant-${{ steps.version.outputs.version }}-macos.sha256"
+          ls -la
+
+      - name: Upload build artifact (never published)
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.asset_suffix }}
+          path: assets/
+
+      - name: Publish GitHub Release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: assets/*
+          generate_release_notes: true
