@@ -41,6 +41,30 @@ MCP_BINARY = "notebooklm-mcp"
 # mcp 1.x and is the combination proven to work, so constrain it here.
 FASTMCP_CONSTRAINT = "fastmcp<3"
 
+
+def _read_bundled_version() -> str:
+    """Read the app version injected by the build pipeline.
+
+    CI writes the release tag into `version.txt` and bundles it next to the
+    app (PyInstaller --add-data). When running from source the repo's
+    placeholder file says "dev", which also disables update checks.
+    """
+    for base in (getattr(sys, "_MEIPASS", None), os.path.dirname(os.path.abspath(__file__))):
+        if not base:
+            continue
+        try:
+            path = Path(base) / "version.txt"
+            if path.is_file():
+                value = path.read_text(encoding="utf-8").strip()
+                if value and value.lower() != "dev":
+                    return value
+        except OSError:
+            continue
+    return "dev"
+
+
+APP_VERSION = _read_bundled_version()
+
 # Status indicator glyphs expressed as escapes to keep this source ASCII-only.
 DOT_RED = "\u25cf"     # filled circle
 DOT_GREEN = "\u2713"   # check mark
@@ -56,7 +80,7 @@ logger = logging.getLogger(__name__)
 class MCPIntegrationApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Claude MCP Integration Assistant")
+        self.title(f"Claude MCP Integration Assistant v{APP_VERSION}")
         self.geometry("880x770")
         self.minsize(800, 710)
         self.grid_columnconfigure(0, weight=1)
@@ -70,6 +94,7 @@ class MCPIntegrationApp(ctk.CTk):
         # Cache of environment tooling paths (populated lazily).
         self._installer_info: Dict[str, Optional[str]] = {}
         self.create_widgets()
+        self.log_message(f"Claude MCP Integration Assistant v{APP_VERSION}" + (" (dev build - update checks disabled)" if APP_VERSION == "dev" else ""))
         # Run the first environment/status scan in the background so the
         # window appears instantly even on slow filesystems.
         self.after(100, self._initial_scan)
