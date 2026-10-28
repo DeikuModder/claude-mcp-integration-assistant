@@ -75,6 +75,15 @@ jobs:
           --add-data "version.txt${{ matrix.path_sep }}."
           main.py
 
+      - name: Ad-hoc codesign macOS bundle
+        if: matrix.os == 'macos-latest'
+        run: |
+          # Unsigned PyInstaller output trips Gatekeeper with "damaged".
+          # Re-signing the whole bundle ad-hoc turns that into the friendly
+          # "unidentified developer" right-click Open dialog.
+          codesign --force --deep --sign - dist/ClaudeMCPIntegrationAssistant.app
+          codesign --verify --deep --strict dist/ClaudeMCPIntegrationAssistant.app
+
       - name: Stage Windows asset
         if: matrix.os == 'windows-latest'
         shell: bash
