@@ -67,11 +67,11 @@ jobs:
           --add-data "version.txt${{ matrix.path_sep }}."
           main.py
 
-      - name: Build macOS executable
+      - name: Build macOS .app bundle
         if: matrix.os == 'macos-latest'
         run: >
           pyinstaller --name "ClaudeMCPIntegrationAssistant"
-          --windowed --onefile --noconfirm
+          --windowed --onedir --noconfirm
           --add-data "version.txt${{ matrix.path_sep }}."
           main.py
 
@@ -92,12 +92,14 @@ jobs:
         shell: bash
         run: |
           mkdir -p assets
-          cp dist/ClaudeMCPIntegrationAssistant \
-             "assets/ClaudeMCPIntegrationAssistant-${{ steps.version.outputs.version }}-macos"
-          chmod +x "assets/ClaudeMCPIntegrationAssistant-${{ steps.version.outputs.version }}-macos"
+          test -d dist/ClaudeMCPIntegrationAssistant.app || { echo "missing .app bundle"; exit 1; }
+          # ditto keeps bundle metadata/permissions correct under macOS zip
+          ditto -c -k --sequesterRsrc \
+            dist/ClaudeMCPIntegrationAssistant.app \
+            "assets/ClaudeMCPIntegrationAssistant-${{ steps.version.outputs.version }}-macos.zip"
           cd assets
-          shasum -a 256 "ClaudeMCPIntegrationAssistant-${{ steps.version.outputs.version }}-macos" \
-            > "ClaudeMCPIntegrationAssistant-${{ steps.version.outputs.version }}-macos.sha256"
+          shasum -a 256 "ClaudeMCPIntegrationAssistant-${{ steps.version.outputs.version }}-macos.zip" \
+            > "ClaudeMCPIntegrationAssistant-${{ steps.version.outputs.version }}-macos.zip.sha256"
           ls -la
 
       - name: Upload build artifact (never published)

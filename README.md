@@ -27,10 +27,12 @@ Grab the latest package for your platform from the
 [Releases page](https://github.com/DeikuModder/claude-mcp-integration-assistant/releases/latest):
 
 - `ClaudeMCPIntegrationAssistant-<version>-windows.exe`
-- `ClaudeMCPIntegrationAssistant-<version>-macos` (Apple Silicon)
+- `ClaudeMCPIntegrationAssistant-<version>-macos.zip` (Apple Silicon)
 
-On macOS, if Gatekeeper blocks the app because it is unsigned, right-click the
-file and choose **Open** once; after that it launches normally.
+On macOS: unzip the file, drag `ClaudeMCPIntegrationAssistant.app` anywhere you
+like (e.g. Applications) and double-click it. If Gatekeeper blocks first launch
+because the app is unsigned, right-click the .app and choose **Open** once;
+after that it launches normally.
 
 ### Development
 

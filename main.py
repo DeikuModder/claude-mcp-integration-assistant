@@ -78,7 +78,9 @@ def _update_asset_name(version: str) -> str:
     """Asset filename produced by CI for the OS this app is running on."""
     if platform.system() == "Windows":
         return f"ClaudeMCPIntegrationAssistant-{version}-windows.exe"
-    return f"ClaudeMCPIntegrationAssistant-{version}-macos"
+    # macOS ships a zipped .app bundle; a bare unix binary cannot be
+    # double-clicked in Finder and is unusable for end users.
+    return f"ClaudeMCPIntegrationAssistant-{version}-macos.zip"
 
 # Status indicator glyphs expressed as escapes to keep this source ASCII-only.
 DOT_RED = "\u25cf"     # filled circle
@@ -1046,7 +1048,22 @@ class MCPIntegrationApp(ctk.CTk):
                 self.log_message("Release has no checksum file; skipping verification (not recommended).", level="WARNING")
 
             self.log_message(f"Update v{version} downloaded and verified.")
-            self.after(0, lambda: self._apply_update(target, asset_name))
+            if platform.system() == "Windows":
+                self.after(0, lambda: self._apply_update(target, asset_name))
+            else:
+                # The mac asset is a zipped .app bundle: extract it now and
+                # hand the resolved bundle to the apply step.
+                staging = temp_dir / f"{version}-staged"
+                extract = subprocess.run(
+                    ["ditto", "-x", "-k", str(target), str(staging)],
+                    capture_output=True, text=True, timeout=120,
+                )
+                if extract.returncode != 0:
+                    raise RuntimeError(f"unzip failed: {(extract.stderr or '').strip()[:200]}")
+                staged_app = next((p for p in staging.rglob("*") if p.name.endswith(".app") and p.is_dir()), None)
+                if not staged_app:
+                    raise RuntimeError("No .app bundle found inside the downloaded zip")
+                self.after(0, lambda: self._apply_update(staged_app, asset_name))
         except Exception as exc:
             message = str(exc)
             self.log_message(f"Update download failed: {message}", level="ERROR")
@@ -1097,15 +1114,30 @@ class MCPIntegrationApp(ctk.CTk):
         self.log_message("Update staged; closing app so the new version can take its place...")
         self.after(600, self.on_closing)
 
-    def _apply_update_posix(self, new_binary: Path, current: Path):
-        """On macOS the running binary can be replaced via atomic rename."""
-        staged = current.with_name(current.name + ".new")
-        shutil.copyfile(new_binary, staged)
-        os.chmod(staged, 0o755)
-        os.replace(staged, current)
-        self.log_message("Update installed; restarting...")
-        subprocess.Popen([str(current)], start_new_session=True)
-        self.after(600, self.on_closing)
+    def _apply_update_posix(self, staged: Path, current: Path):
+        """Swap the installed .app bundle for the freshly downloaded one.
+
+        POSIX allows replacing files that are currently running. If this app
+        somehow runs outside a bundle (bare binary), fall back to replacing
+        just the executable.
+        """
+        bundle = next((p for p in current.parents if p.name.endswith(".app")), None)
+        if bundle:
+            parent = bundle.parent
+            installed = parent / bundle.name
+            shutil.rmtree(bundle)
+            shutil.move(str(staged), str(installed))
+            self.log_message("Update installed; restarting...")
+            subprocess.Popen(["open", "-a", str(installed)], start_new_session=False)
+            self.after(600, self.on_closing)
+        else:
+            staged_binary = current.with_name(current.name + ".new")
+            shutil.copyfile(staged, staged_binary)
+            os.chmod(staged_binary, 0o755)
+            os.replace(staged_binary, current)
+            self.log_message("Update installed; restarting...")
+            subprocess.Popen([str(current)], start_new_session=True)
+            self.after(600, self.on_closing)
 
 
 def main():
