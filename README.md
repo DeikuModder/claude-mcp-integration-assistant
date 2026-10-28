@@ -30,9 +30,19 @@ Grab the latest package for your platform from the
 - `ClaudeMCPIntegrationAssistant-<version>-macos.zip` (Apple Silicon)
 
 On macOS: unzip the file, drag `ClaudeMCPIntegrationAssistant.app` anywhere you
-like (e.g. Applications) and double-click it. If Gatekeeper blocks first launch
-because the app is unsigned, right-click the .app and choose **Open** once;
-after that it launches normally.
+like (e.g. Applications) and double-click it. Because the app is unsigned
+(no Apple Developer notarization), macOS asks for confirmation on first launch:
+right-click the .app and choose **Open** once; after that it launches normally.
+
+If macOS ever says the app "is damaged and can't be opened", the download got
+itself quarantined; remove that flag in Terminal and try again:
+
+```bash
+xattr -cr /Applications/ClaudeMCPIntegrationAssistant.app
+```
+
+(Adjust the path if you keep the app somewhere else. Alternatively use
+System Settings > Privacy & Security > Open Anyway.)
 
 ### Development
 
